@@ -1,0 +1,114 @@
+name: Deploy Frontend
+
+on:
+  push:
+    branches:
+      - dev
+      - test
+      - main
+    paths:
+      - 'frontend/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        type: choice
+        options:
+          - dev
+          - test
+          - prod
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Determine Environment
+        id: env
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            ENV="${{ github.event.inputs.environment }}"
+          elif [ "${{ github.ref }}" == "refs/heads/dev" ]; then
+            ENV="dev"
+          elif [ "${{ github.ref }}" == "refs/heads/test" ]; then
+            ENV="test"
+          elif [ "${{ github.ref }}" == "refs/heads/main" ]; then
+            ENV="prod"
+          else
+            ENV="dev"
+          fi
+          echo "environment=${ENV}" >> $GITHUB_OUTPUT
+          echo "Deploying to ${ENV} environment"
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+      
+      - name: Install dependencies
+        working-directory: ./frontend
+        run: npm install
+      
+      - name: Build
+        working-directory: ./frontend
+        env:
+          VITE_API_URL: ${{ secrets.API_GATEWAY_URL }}
+        run: npm run build
+      
+      - name: Deploy to S3
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          ENV="${{ steps.env.outputs.environment }}"
+          if [ "${ENV}" == "prod" ]; then
+            BUCKET="${{ secrets.S3_BUCKET_NAME_PROD }}"
+            DIST_ID="${{ secrets.CLOUDFRONT_DISTRIBUTION_ID_PROD }}"
+          elif [ "${ENV}" == "test" ]; then
+            BUCKET="${{ secrets.S3_BUCKET_NAME_TEST }}"
+            DIST_ID="${{ secrets.CLOUDFRONT_DISTRIBUTION_ID_TEST }}"
+          else
+            BUCKET="${{ secrets.S3_BUCKET_NAME_DEV }}"
+            DIST_ID="${{ secrets.CLOUDFRONT_DISTRIBUTION_ID_DEV }}"
+          fi
+          
+          # Fallback to generic secrets if environment-specific ones don't exist
+          BUCKET="${BUCKET:-${{ secrets.S3_BUCKET_NAME }}}"
+          DIST_ID="${DIST_ID:-${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}}"
+          
+          echo "Deploying to S3 bucket: ${BUCKET}"
+          # Vite builds to 'dist' directory, not 'build'
+          if [ -d "frontend/dist" ]; then
+            aws s3 sync frontend/dist s3://${BUCKET} --delete
+          elif [ -d "frontend/build" ]; then
+            aws s3 sync frontend/build s3://${BUCKET} --delete
+          else
+            echo "Error: No build output directory found (dist or build)"
+            exit 1
+          fi
+      
+      - name: Invalidate CloudFront
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          ENV="${{ steps.env.outputs.environment }}"
+          if [ "${ENV}" == "prod" ]; then
+            DIST_ID="${{ secrets.CLOUDFRONT_DISTRIBUTION_ID_PROD }}"
+          elif [ "${ENV}" == "test" ]; then
+            DIST_ID="${{ secrets.CLOUDFRONT_DISTRIBUTION_ID_TEST }}"
+          else
+            DIST_ID="${{ secrets.CLOUDFRONT_DISTRIBUTION_ID_DEV }}"
+          fi
+          
+          # Fallback to generic secret if environment-specific one doesn't exist
+          DIST_ID="${DIST_ID:-${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}}"
+          
+          if [ -n "${DIST_ID}" ]; then
+            echo "Invalidating CloudFront distribution: ${DIST_ID}"
+            aws cloudfront create-invalidation --distribution-id ${DIST_ID} --paths "/*"
+          else
+            echo "No CloudFront distribution ID found for ${ENV} environment"
+          fi
