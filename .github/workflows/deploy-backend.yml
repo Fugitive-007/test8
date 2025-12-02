@@ -1,0 +1,85 @@
+name: Deploy Backend
+
+on:
+  push:
+    branches:
+      - dev
+      - test
+      - main
+    paths:
+      - 'backend/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        type: choice
+        options:
+          - dev
+          - test
+          - prod
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Determine Environment
+        id: env
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            ENV="${{ github.event.inputs.environment }}"
+          elif [ "${{ github.ref }}" == "refs/heads/dev" ]; then
+            ENV="dev"
+          elif [ "${{ github.ref }}" == "refs/heads/test" ]; then
+            ENV="test"
+          elif [ "${{ github.ref }}" == "refs/heads/main" ]; then
+            ENV="prod"
+          else
+            ENV="dev"
+          fi
+          echo "environment=${ENV}" >> $GITHUB_OUTPUT
+          echo "Deploying to ${ENV} environment"
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+      
+      - name: Install dependencies
+        working-directory: ./backend
+        run: npm install
+      
+      - name: Package Lambda
+        working-directory: ./backend
+        run: |
+          zip -r lambda-deployment.zip .
+      
+      - name: Deploy to Lambda
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        working-directory: ./backend
+        run: |
+          ENV="${{ steps.env.outputs.environment }}"
+          if [ "${ENV}" == "prod" ]; then
+            FUNCTION_NAME="${{ secrets.LAMBDA_FUNCTION_NAME_PROD }}"
+          elif [ "${ENV}" == "test" ]; then
+            FUNCTION_NAME="${{ secrets.LAMBDA_FUNCTION_NAME_TEST }}"
+          else
+            FUNCTION_NAME="${{ secrets.LAMBDA_FUNCTION_NAME_DEV }}"
+          fi
+          
+          # Fallback to generic secret if environment-specific one doesn't exist
+          FUNCTION_NAME="${FUNCTION_NAME:-${{ secrets.LAMBDA_FUNCTION_NAME }}}"
+          
+          if [ -n "${FUNCTION_NAME}" ]; then
+            echo "Deploying to Lambda function: ${FUNCTION_NAME}"
+            aws lambda update-function-code \
+              --function-name ${FUNCTION_NAME} \
+              --zip-file fileb://lambda-deployment.zip
+          else
+            echo "No Lambda function name found for ${ENV} environment"
+            exit 1
+          fi
